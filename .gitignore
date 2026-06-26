@@ -1,0 +1,4 @@
+test/vendor/**
+test/tests/_output/**
+test/src/jdb.php
+test/composer.lock

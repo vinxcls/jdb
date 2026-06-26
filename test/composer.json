@@ -1,0 +1,15 @@
+{
+    "name": "vinxcls/jdb-tests",
+    "description": "Test suite for JDB",
+    "require-dev": {
+        "codeception/codeception": "*",
+        "codeception/module-asserts": "^3.3"
+    },
+    "autoload": {
+        "files": [
+            "src/jdb.php",
+            "tests/_bootstrap.php"
+        ]
+    },
+    "minimum-stability": "stable"
+}
