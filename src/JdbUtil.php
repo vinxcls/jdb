@@ -339,9 +339,13 @@ class JdbUtil
 
         if (!@rename($source, $dest)) {
             $lastErr = error_get_last();
-            $error = 'Rename failed: "' . $source . '" -> "' . $dest . '". ' .
+            $error = "Rename failed: '{$source}' -> '{$dest}'" .
                 (isset($lastErr['message']) ? $lastErr['message'] : 'unknown error');
             return false;
+        }
+
+        if (JdbConfig::get('fsync')) {
+            JdbUtil::fsyncPath($dest);
         }
 
         return true;
@@ -446,6 +450,51 @@ class JdbUtil
     {
         $v = crc32($data);
         return $v - ($v < 0) * JdbUtil::UINT32_OVERFLOW;
+    }
+
+    /**
+     * @brief fsync on open file handler
+     *
+     * If available uses fdatasync(), fallback to fsync(), then no-op.
+     *
+     * @param  resource $fp  Writable file handler
+     * @return bool
+     */
+    public static function fsyncFp($fp)
+    {
+        if (function_exists('fdatasync')) {
+            return fdatasync($fp);
+        }
+        if (function_exists('fsync')) {
+            return fsync($fp);
+        }
+        return true; // no-op: PHP < 8.1
+    }
+
+    /**
+     * @brief Directory fsync that contains $path.
+     *
+     * Makes durable rename() / unlink() on the directory.
+     * Mandatory after safeOverwrite() and writeTxnFile() to grant that the renaming is
+     * consistent after a power failure.
+     * No-op on Windows and on FS that doesn't support the directory fsync.
+     *
+     * @param  string $path  Path file into the directory to be synchronized
+     * @return bool
+     */
+    public static function fsyncPath($path)
+    {
+        if (!function_exists('fsync')) {
+            return true; // no-op: PHP < 8.1
+        }
+        $dir = dirname($path);
+        $fp  = @fopen($dir, 'rb');
+        if (!is_resource($fp)) {
+            return false;
+        }
+        $ok = fsync($fp);
+        fclose($fp);
+        return $ok;
     }
 
     /**

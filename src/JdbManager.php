@@ -1111,6 +1111,11 @@ class JdbManager
             if (!is_resource($fp)) {
                 return false;
             }
+            $safeOffset = (int)$dataOffset; // no-op su 64-bit; clip su 32-bit
+            if ($safeOffset < 0) {
+                fclose($fp);
+                return false;
+            }
             if (!ftruncate($fp, $dataOffset)) {
                 fclose($fp);
                 return false;

@@ -272,9 +272,11 @@ class JdbBinaryIndex
             return $this->fail(self::ERR_IO, 'beginWrite',
                 'invalid state (state=' . $this->state . ')');
         }
-        $success = (fseek($this->fp, JdbIndexHeader::HDR_DIRTY_BYTE) === 0) &&
-                   (fwrite($this->fp, "\x01") === 1) &&
-                   fflush($this->fp);
+        $fp = $this->fp;
+        $success = (fseek($fp, JdbIndexHeader::HDR_DIRTY_BYTE) === 0) &&
+                   (fwrite($fp, "\x01") === 1) &&
+                   fflush($fp) &&
+                   (!JdbConfig::get('fsync') || JdbUtil::fsyncFp($fp));
         if (!$success) {
             return $this->fail(self::ERR_IO, 'beginWrite', 'set dirty failed');
         }
@@ -290,9 +292,11 @@ class JdbBinaryIndex
             return $this->fail(self::ERR_IO, 'commitWrite',
                 'invalid state (state=' . $this->state . ', expected STATE_WRITING)');
         }
-        $success = (fseek($this->fp, JdbIndexHeader::HDR_DIRTY_BYTE) === 0) &&
-                   (fwrite($this->fp, "\x00") === 1) &&
-                   fflush($this->fp);
+        $fp = $this->fp;
+        $success = (fseek($fp, JdbIndexHeader::HDR_DIRTY_BYTE) === 0) &&
+                   (fwrite($fp, "\x00") === 1) &&
+                   fflush($fp) &&
+                   (!JdbConfig::get('fsync') || JdbUtil::fsyncFp($fp));
         if (!$success) {
             return $this->fail(self::ERR_IO, 'commitWrite', 'clear dirty failed');
         }
@@ -324,7 +328,7 @@ class JdbBinaryIndex
             return self::ERR_IO;
         }
 
-        $success = $this->writeHeaderToFp($fp, $slots, 0, $nextId, 0) &&
+        $success = $this->writeHeaderToFp($fp, $slots, 0, $nextId, 0, JdbIndexHeader::HDR_COUNTERS_INVALID, JdbIndexHeader::HDR_COUNTERS_INVALID) &&
                    JdbUtil::writeEmptySlots($fp, $slots, self::SLOT_SIZE);
         
         fclose($fp);
@@ -353,7 +357,7 @@ class JdbBinaryIndex
         }
 
         // Initialise: header + empty slots
-        $success = $this->writeHeaderToFp($fp, $slots, 0, $nextId, 0) &&
+        $success = $this->writeHeaderToFp($fp, $slots, 0, $nextId, 0, 0, 0) &&
             JdbUtil::writeEmptySlots($fp, $slots, self::SLOT_SIZE);
 
         if (!$success) {
@@ -388,7 +392,7 @@ class JdbBinaryIndex
         }
 
         // Update the actual count in the header
-        $success = $this->writeHeaderToFp($fp, $slots, $written, $nextId, 0);
+        $success = $this->writeHeaderToFp($fp, $slots, $written, $nextId, 0, JdbIndexHeader::HDR_COUNTERS_INVALID, JdbIndexHeader::HDR_COUNTERS_INVALID);
 
         fclose($fp);
         return $success ? self::OK : self::ERR_IO;
@@ -532,8 +536,15 @@ class JdbBinaryIndex
             return $this->fail(self::ERR_IO, 'put',
                 "idxWriteSlot failed [slot={$writeSlot}, offset={$offset}, length={$length}]");
         }
-        $count = $header['count'] + 1;
-        if ($isNew && ($this->idxWriteHeader($slots, $count, $header['next_id']) === false)) {
+        $count = $header['count'];
+        if ($isNew) {
+            $count++;
+        }
+        $newObsolete = $header['obsolete_versions'];
+        if (!$isNew && ($newObsolete !== JdbIndexHeader::HDR_COUNTERS_INVALID)) {
+            $newObsolete++;
+        }
+        if ($this->idxWriteHeader($slots, $count, $header['next_id'], $header['deleted_count'], $newObsolete) === false) {
             return $this->fail(self::ERR_IO, 'put',
                     "idxWriteHeader post-insert failed [count={$count}]");
         }
@@ -578,8 +589,16 @@ class JdbBinaryIndex
             return $this->fail(self::ERR_IO, 'remove',
                 'idxWriteSlot FLAG_DELETED failed [slot=' . $probe['slot'] . ', id=' . $id . ']');
         }
-
-        if ($this->idxWriteHeader($header['slots'], $header['count'] - 1, $header['next_id']) === false) {
+        $newDeleted = $header['deleted_count'];
+        if ($newDeleted !== JdbIndexHeader::HDR_COUNTERS_INVALID) {
+            $newDeleted++;
+        }
+        $newObsolete = $header['obsolete_versions'];
+        if ($newObsolete !== JdbIndexHeader::HDR_COUNTERS_INVALID) {
+            $newObsolete++;
+        }
+        if ($this->idxWriteHeader($header['slots'], $header['count'] - 1, $header['next_id'], $newDeleted,
+                                  $newObsolete) === false) {
             return $this->fail(self::ERR_IO, 'remove',
                 'idxWriteHeader post-delete failed [count=' . ($header['count'] - 1) . ']');
         }
@@ -730,6 +749,54 @@ class JdbBinaryIndex
     }
 
     /**
+     * Returns the deleted_count and obsolete_versions counters from the header.
+     * Used by JsonDatabase::getStats()
+     * Returns null if the index is not open or the header is unreadable.
+     *
+     * @return array|null ['deleted_count' => int, 'obsolete_versions' => int] | null
+     */
+    public function headerCounters()
+    {
+        if ($this->state < self::STATE_OPEN) {
+            return null;
+        }
+        $h = $this->idxReadHeader();
+        if ($h === null) {
+            return null;
+        }
+        return array(
+            'deleted_count'     => isset($h['deleted_count']) ? $h['deleted_count'] : JdbIndexHeader::HDR_COUNTERS_INVALID,
+            'obsolete_versions' => isset($h['obsolete_versions']) ? $h['obsolete_versions'] : JdbIndexHeader::HDR_COUNTERS_INVALID,
+        );
+    }
+
+    /**
+     * Update the counter into the header.
+     * Called by JsonDatabase::getStats() after the fallback scan.
+     *
+     * @param  int $deletedCount
+     * @param  int $obsoleteVersions
+     * @return bool
+     */
+    public function updateCounters($deletedCount, $obsoleteVersions)
+    {
+        $fp = fopen($this->file, 'r+b');
+        if (!is_resource($fp)) {
+            return false;
+        }
+        $h = JdbIndexHeader::read($fp);
+        if ($h === null) {
+            fclose($fp);
+            return false;
+        }
+        $ok = JdbIndexHeader::write($fp,
+            $h['slots'], $h['count'], $h['next_id'], $h['dirty'],
+            (int)$deletedCount, (int)$obsoleteVersions);
+        fclose($fp);
+        return ($ok !== false);
+    }
+
+    /**
      * Increments next_id in the header. Call after a successful insert().
      */
     public function bumpNextId()
@@ -744,7 +811,7 @@ class JdbBinaryIndex
         }
 
         $incrNextId = $header['next_id'] + 1;
-        if ($this->idxWriteHeader($header['slots'], $header['count'], $incrNextId) === false) {
+        if ($this->idxWriteHeader($header['slots'], $header['count'], $incrNextId, $header['deleted_count'], $header['obsolete_versions']) === false) {
             return $this->fail(self::ERR_IO, 'bumpNextId', "idxWriteHeader failed [next_id={$incrNextId}]");
         }
 
@@ -781,11 +848,13 @@ class JdbBinaryIndex
      * @param int $slots
      * @param int $count
      * @param int $nextId
+     * @param int $deletedCount
+     * @param int $obsoleteVersions
      */
-    private function idxWriteHeader($slots, $count, $nextId)
+    private function idxWriteHeader($slots, $count, $nextId, $deletedCount, $obsoleteVersions)
     {
         $dirty = ($this->state === self::STATE_WRITING) ? 1 : 0;
-        if (JdbIndexHeader::write($this->fp, $slots, $count, $nextId, $dirty) === false) {
+        if (JdbIndexHeader::write($this->fp, $slots, $count, $nextId, $dirty, $deletedCount, $obsoleteVersions) === false) {
             return false;
         }
 
@@ -797,6 +866,8 @@ class JdbBinaryIndex
             'count'   => $count,
             'next_id' => $nextId,
             'dirty'   => $dirty,
+            'deleted_count'      => $deletedCount,
+            'obsolete_versions'  => $obsoleteVersions,
         );
         return true;
     }
@@ -810,10 +881,12 @@ class JdbBinaryIndex
      * @param int      $count
      * @param int      $nextId
      * @param int      $dirty  0 or 1
+     * @param int      $deletedCount
+     * @param int      $obsoleteVersions
      */
-    private function writeHeaderToFp($fp, $slots, $count, $nextId, $dirty)
+    private function writeHeaderToFp($fp, $slots, $count, $nextId, $dirty, $deletedCount, $obsoleteVersions)
     {
-        return JdbIndexHeader::write($fp, $slots, $count, $nextId, $dirty);
+        return JdbIndexHeader::write($fp, $slots, $count, $nextId, $dirty, $deletedCount, $obsoleteVersions);
     }
 
     // =========================================================================
@@ -1033,7 +1106,7 @@ class JdbBinaryIndex
             return false;
         }
 
-        $success = $this->writeHeaderToFp($newFp, $newSlots, 0, $oldHeader['next_id'], $dirty) &&
+        $success = $this->writeHeaderToFp($newFp, $newSlots, 0, $oldHeader['next_id'], $dirty, 0, 0) &&
                    JdbUtil::writeEmptySlots($newFp, $newSlots, self::SLOT_SIZE);
         if (!$success) {
             $this->fail(self::ERR_IO, 'idxGrow', "write failed [new_slots={$newSlots}]");
@@ -1099,7 +1172,7 @@ class JdbBinaryIndex
         ($writeFailCount > 0) && JdbErrorHandler::push('JdbBinaryIndex', 'idxGrow',
             "writeSlotToFp non-fatal failures: {$writeFailCount} slots lost (active={$active}/{$oldHeader['count']})");
 
-        return $this->writeHeaderToFp($newFp, $newSlots, $active, $oldHeader['next_id'], $dirty) ?
+        return $this->writeHeaderToFp($newFp, $newSlots, $active, $oldHeader['next_id'], $dirty, 0, 0) ?
             $active :
             $this->fail(self::ERR_IO, 'idxGrow', "writeHeaderToFp final write failed [active={$active}]");
     }
@@ -1191,10 +1264,12 @@ class JdbBinaryIndex
      * @param int      $count
      * @param int      $nextId
      * @param int      $dirty   0 = clean, 1 = write in progress
+     * @param int      $deletedCount
+     * @param int      $obsoleteVersions
      */
-    public static function writeHeader($fp, $slots, $count, $nextId, $dirty)
+    public static function writeHeader($fp, $slots, $count, $nextId, $dirty, $deletedCount, $obsoleteVersions)
     {
-        return JdbIndexHeader::write($fp, $slots, $count, $nextId, $dirty);
+        return JdbIndexHeader::write($fp, $slots, $count, $nextId, $dirty, $deletedCount, $obsoleteVersions);
     }
 
     /**
@@ -1207,7 +1282,7 @@ class JdbBinaryIndex
      */
     public static function initFile($fp, $slots, $nextId)
     {
-        return self::writeHeader($fp, $slots, 0, $nextId, 0) && 
+        return self::writeHeader($fp, $slots, 0, $nextId, 0, 0, 0) && 
                JdbUtil::writeEmptySlots($fp, $slots, self::SLOT_SIZE);
     }
 
@@ -1285,7 +1360,7 @@ class JdbBinaryIndex
         if ($header === null) {
             return $this->fail(self::ERR_IO, 'advanceNextId', 'idxReadHeader returned null');
         }
-        if ($this->idxWriteHeader($header['slots'], $header['count'], $header['next_id'] + $n) === false) {
+        if ($this->idxWriteHeader($header['slots'], $header['count'], $header['next_id'] + $n, $header['deleted_count'], $header['obsolete_versions']) === false) {
             return $this->fail(self::ERR_IO, 'advanceNextId', 'idxWriteHeader failed [next_id=' . ($header['next_id'] + $n) . ']');
         }
         return self::OK;

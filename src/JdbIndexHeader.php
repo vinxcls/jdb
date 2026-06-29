@@ -18,7 +18,9 @@ require_once __DIR__ . "/JdbUtil.php";
  *   9–12    V    count    uint32 LE – active records
  *   13–16   V    next_id  uint32 LE – always 0 in secondary indexes
  *   17      C    dirty    0 = clean, 1 = write in progress or rebuild needed
- *   18–31        reserved zero padding (14 bytes)
+ *   18–21   V    deleted_count      uint32 
+ *   22–25   V    obsolete_versions  uint32 LE
+ *   26–31        reserved zero padding (6 bytes)
  * @endcode
  *
  * @note Compatible with PHP 5.5+.
@@ -54,6 +56,13 @@ class JdbIndexHeader
      */
     const HDR_DIRTY_BYTE = 17;
 
+    /**
+     * @var int Sentinel value: the counters are non valid (post-rebuild).
+     *          getStats() executes always the fallback of the scan on the file.
+     *          Resetted to 0 in vacuum() after the compact.
+     */
+    const HDR_COUNTERS_INVALID = 0xFFFFFFFF;
+
     // =========================================================================
     // Header I/O on an already-open file handle
     // =========================================================================
@@ -73,11 +82,11 @@ class JdbIndexHeader
     public static function read($fp)
     {
         if (is_resource($fp) && (fseek($fp, 0) === 0)) {
-            $raw = fread($fp, 18);
-            if ($raw === false || strlen($raw) < 18) {
+            $raw = fread($fp, 26);
+            if ($raw === false || strlen($raw) < 26) {
                 return null;
             }
-            $h = unpack('a4magic/Cversion/Vslots/Vcount/Vnext_id/Cdirty', $raw);
+            $h = unpack('a4magic/Cversion/Vslots/Vcount/Vnext_id/Cdirty/Vdeleted_count/Vobsolete_versions', $raw);
             if ($h['magic'] === self::MAGIC) {
                 return $h;
             }
@@ -97,27 +106,30 @@ class JdbIndexHeader
      * @param int      $count    Number of currently active records.
      * @param int      $nextId  Next auto-increment ID; pass 0 for secondary indexes.
      * @param int      $dirty    Dirty flag: 0 = clean, 1 = write in progress / rebuild needed.
+     * @param int      $deletedCount
+     * @param int      $obsoleteVersions
      * @return bool|null         @c true on success, @c false if the seek or write fails,
      *                           @c null if @p $fp is not a valid resource.
      */
-    public static function write($fp, $slots, $count, $nextId, $dirty)
+    public static function write($fp, $slots, $count, $nextId, $dirty,
+                                  $deletedCount = 0, $obsoleteVersions = 0)
     {
         if (!is_resource($fp)) {
             return null;
         }
+        $maxInt           = 0xFFFFFFFF;
+        $minInt           = 0;
+        $slots            = (int)max($minInt, min($maxInt, $slots));
+        $count            = (int)max($minInt, min($maxInt, $count));
+        $nextId           = (int)max($minInt, min($maxInt, $nextId));
+        $dirty            = $dirty ? 1 : 0;
+        $deletedCount     = (int)max($minInt, min($maxInt, $deletedCount));
+        $obsoleteVersions = (int)max($minInt, min($maxInt, $obsoleteVersions));
 
-        // Clamp all uint32 fields to [0, 0xFFFFFFFF] to prevent pack() overflow.
-        $maxInt  = 0xFFFFFFFF;
-        $minInt  = 0;
-        $slots   = (int)max($minInt, min($maxInt, $slots));
-        $count   = (int)max($minInt, min($maxInt, $count));
-        $nextId = (int)max($minInt, min($maxInt, $nextId));
-        $dirty   = $dirty ? 1 : 0;
-
-        // 'x14' appends 14 null bytes of reserved padding to reach HDR_SIZE (32).
-        $header = pack('a4CVVVCx14',
+        $header = pack('a4CVVVCVVx6',
                     self::MAGIC, self::VERSION,
-                    $slots, $count, $nextId, $dirty);
+                    $slots, $count, $nextId, $dirty,
+                    $deletedCount, $obsoleteVersions);
         return (fseek($fp, 0) === 0) && (fwrite($fp, $header) === self::HDR_SIZE);
     }
 
@@ -209,7 +221,7 @@ class JdbIndexHeader
         if (!is_resource($fp)) {
             return false;
         }
-        $ok = (self::write($fp, 0, 0, (int)$nextId, (int)$dirty) !== false);
+        $ok = (self::write($fp, 0, 0, (int)$nextId, (int)$dirty, self::HDR_COUNTERS_INVALID, self::HDR_COUNTERS_INVALID) !== false);
         fclose($fp);
         return $ok;
     }

@@ -441,19 +441,19 @@ class JdbTransactionTest extends \PHPUnit\Framework\TestCase
 
         $fakePid = 9999998;
         $randomHex = bin2hex(random_bytes(8));
-        
-        // Payload: magic (4), version (2), count (1), pid (4)
-        $payload = pack('a4vCV', JdbTransaction::TXN_MAGIC, JdbTransaction::TXN_VERSION, 2, $fakePid);
-        $payload .= $this->packU64(time());
-        $payload .= pack('a8', hex2bin($randomHex));
+
+        // Replicates writeTxnFile() exactly: pack('a4vCVVa8', ...) = 23 bytes payload + 4 CRC.
+        // Timestamp is uint32 (V), NOT uint64. Same for table offsets.
+        $payload = pack('a4vCVVa8',
+            JdbTransaction::TXN_MAGIC, JdbTransaction::TXN_VERSION,
+            2, $fakePid, time(), hex2bin($randomHex));
         $payload .= pack('V', JdbUtil::crc32u($payload));
 
+        // Per-table record: pack('Ca63VV', ...) = 1+63+4+4 = 72 bytes (TXN_TABLE_SIZE).
         // Table 1 record
-        $tableData = pack('Ca63', strlen($this->testTable), $this->testTable);
-        $tableData .= $this->packU64($initialSize1) . $this->packU64(0);
+        $tableData  = pack('Ca63VV', strlen($this->testTable), $this->testTable, $initialSize1, 0);
         // Table 2 record
-        $tableData .= pack('Ca63', strlen($table2), $table2);
-        $tableData .= $this->packU64($initialSize2) . $this->packU64(0);
+        $tableData .= pack('Ca63VV', strlen($table2), $table2, $initialSize2, 0);
 
         $contents = JdbUtil::PHP_DIE_HEADER . $payload . $tableData;
         $txnFile = $this->testDataDir . "/.txn_{$fakePid}_{$randomHex}.php";
@@ -471,6 +471,7 @@ class JdbTransactionTest extends \PHPUnit\Framework\TestCase
         $this->assertSame(0, JdbManager::count($this->testTable));
         $this->assertSame(0, JdbManager::count($table2));
     }
+
 
     // =========================================================================
     // 9. OPTIMISTIC VERSIONING (update/delete with expectedVersion)
@@ -1000,15 +1001,25 @@ class JdbTransactionTest extends \PHPUnit\Framework\TestCase
         $randomHex   = JdbUtil::randomSuffix(8);
         $randomBytes = hex2bin($randomHex);
 
-        $payload  = pack('a4vCV', JdbTransaction::TXN_MAGIC, JdbTransaction::TXN_VERSION, 1, $fakePid);
-        $payload .= $this->packU64(time());
-        $payload .= pack('a8', $randomBytes);
+        // Replicates writeTxnFile() exactly:
+        //   pack('a4vCVVa8', magic, version, count, pid, time(), randomBytes)
+        //   = 4+2+1+4+4+8 = 23 bytes of payload, then 4 bytes of CRC32
+        // timestamp is stored as a single uint32 (V), NOT as a uint64.
+        $payload  = pack('a4vCVVa8',
+            JdbTransaction::TXN_MAGIC,
+            JdbTransaction::TXN_VERSION,
+            1,          // table count
+            $fakePid,
+            time(),     // uint32, NOT packU64
+            $randomBytes
+        );
         $payload .= pack('V', JdbUtil::crc32u($payload));
 
-        $nameLen    = strlen($table);
-        $tableData  = pack('Ca63', $nameLen, $table);
-        $tableData .= $this->packU64($dataOffset);
-        $tableData .= $this->packU64(0);
+        // Per-table record: pack('Ca63VV', nameLen, name, dataOffset, indexOffset)
+        //   = 1+63+4+4 = 72 bytes  (TXN_TABLE_SIZE)
+        // offsets are stored as uint32 (V), NOT as uint64.
+        $nameLen   = strlen($table);
+        $tableData = pack('Ca63VV', $nameLen, $table, $dataOffset, 0);
 
         $contents = JdbUtil::PHP_DIE_HEADER . $payload . $tableData;
         $txnName  = sprintf('.txn_%d_%s.php', $fakePid, $randomHex);

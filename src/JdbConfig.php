@@ -36,6 +36,7 @@ class JdbConfig
      *   - lock_backend        (string)      Locking strategy: 'flock' or other registered backend.
      *   - lock_timeout_ms     (int)         Maximum time to wait for a lock, in milliseconds.
      *   - realpath_cache_ttl  (int)         TTL for JdbRealpathCache entries, in seconds.
+     *   - fsync               (bool)        Requires PHP >= 8.1
      */
     private static $sharedDefaults = array(
         'data_dir' => null,
@@ -45,6 +46,7 @@ class JdbConfig
         'lock_backend' => 'flock',
         'lock_timeout_ms' => 500,
         'realpath_cache_ttl' => 3600,
+        'fsync' => false,
     );
 
     /**

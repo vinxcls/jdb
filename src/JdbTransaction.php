@@ -75,11 +75,11 @@ class JdbTransaction
     /** @var string rollback() completed successfully. */
     const STATE_ROLLED_BACK = 'rolled_back';
 
-    /** @var int Size in bytes of the fixed binary header (4+2+1+4+8+8+4 = 31). */
-    const TXN_FIXED_SIZE  = 31;
+    /** @var int Size in bytes of the fixed binary header (4+2+1+4+8+4+4 = 27). */
+    const TXN_FIXED_SIZE  = 27;
 
-    /** @var int Size in bytes of each per-table record (1+63+8+8 = 80). */
-    const TXN_TABLE_SIZE  = 80;
+    /** @var int Size in bytes of each per-table record (1+63+8+4 = 72). */
+    const TXN_TABLE_SIZE  = 72;
 
     /** @var string Four-byte magic word identifying a JDB transaction file. */
     const TXN_MAGIC       = 'JDBT';
@@ -495,45 +495,6 @@ class JdbTransaction
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Private: uint64 serialisation
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * @brief Serialises an integer as a uint64 little-endian value (two consecutive uint32 LE).
-     *
-     * Compatible with PHP 5.5: does not use the 'P' pack() format which requires
-     * PHP >= 5.6.3. Requires a 64-bit architecture (PHP integer = 64-bit signed).
-     *
-     * @param  int $value Integer value to encode.
-     * @return string 8 raw bytes.
-     */
-    private static function packU64($value)
-    {
-        $value = (int)$value;
-        $lo    = $value & 0xFFFFFFFF;
-        $hi    = ($value >> 32) & 0xFFFFFFFF;
-        return pack('VV', $lo, $hi);
-    }
-
-    /**
-     * @brief Deserialises 8 bytes starting at $pos as a uint64 little-endian value.
-     *
-     * Uses multiplication instead of bit-shifting to avoid incorrect results on
-     * 32-bit PHP builds.
-     *
-     * @param  string $bin Binary string containing the encoded value.
-     * @param  int    $pos Byte offset within $bin at which the 8-byte value starts.
-     * @return int Decoded integer value.
-     */
-    private static function unpackU64($bin, $pos)
-    {
-        $lo = unpack('V', substr($bin, $pos,     4));
-        $hi = unpack('V', substr($bin, $pos + 4, 4));
-        // Multiply instead of shift to avoid issues on 32-bit PHP builds
-        return (int)$lo[1] + (int)$hi[1] * JdbUtil::UINT32_OVERFLOW;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
     // Private: .txn file
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -567,9 +528,7 @@ class JdbTransaction
         //   V   pid (uint32 LE)
         //   VV  timestamp (uint64 LE via packU64)
         //   a8  random id
-        $payload  = pack('a4vCV', self::TXN_MAGIC, self::TXN_VERSION, $count, $pid);
-        $payload .= self::packU64(time());
-        $payload .= pack('a8', $randomBytes);
+        $payload  = pack('a4vCVVa8', self::TXN_MAGIC, self::TXN_VERSION, $count, $pid, time(), $randomBytes);
         // CRC covers the 27 payload bytes; masked to 32 bits for consistency on
         // 64-bit platforms where crc32() may return negative signed integers
         $payload .= pack('V', JdbUtil::crc32u($payload));
@@ -585,9 +544,7 @@ class JdbTransaction
             if ($nameLen > self::TXN_MAX_NAME) {
                 return $this->fail('writeTxnFile', 'Table name too long (' . $nameLen . ' > ' . self::TXN_MAX_NAME . '): ' . $table);
             }
-            $tableData .= pack('Ca63', $nameLen, $table);
-            $tableData .= self::packU64($offsets['data']);
-            $tableData .= self::packU64($offsets['index']);
+            $tableData .= pack('Ca63VV', $nameLen, $table, $offsets['data'], $offsets['index']);
         }
 
         $contents = JdbUtil::PHP_DIE_HEADER . $payload . $tableData;
@@ -600,9 +557,21 @@ class JdbTransaction
             return $this->fail('writeTxnFile', 'Failed to write .txn temporary file: ' . $tmp);
         }
 
+        if (JdbConfig::get('fsync')) {
+            $tmpFp = @fopen($tmp, 'rb');
+            if (is_resource($tmpFp)) {
+                JdbUtil::fsyncFp($tmpFp);
+                fclose($tmpFp);
+            }
+        }
+
         if (!rename($tmp, $final)) {
             unlink($tmp);
             return $this->fail('writeTxnFile', 'Failed to rename .txn file in: ' . $final);
+        }
+
+        if (JdbConfig::get('fsync')) {
+            JdbUtil::fsyncPath($final);
         }
 
         $this->txnFile = $final;
@@ -638,9 +607,10 @@ class JdbTransaction
         // Skip the PHP die header; read the 31-byte fixed binary header
         $fixedRaw = substr($raw, JdbUtil::DATA_HEADER_SIZE, self::TXN_FIXED_SIZE);
 
-        // CRC check covers the first 27 bytes of the fixed header
-        $crcPayload = substr($fixedRaw, 0, 27);
-        $storedCrc  = unpack('V', substr($fixedRaw, 27, 4));
+        // CRC check covers the first 23 bytes of the fixed header
+        $payloadSize = self::TXN_FIXED_SIZE - 4;
+        $crcPayload = substr($fixedRaw, 0, $payloadSize);
+        $storedCrc  = unpack('V', substr($fixedRaw, $payloadSize, 4));
         $storedCrc  = (int)$storedCrc[1];
         $computed   = JdbUtil::crc32u($crcPayload);
         if ($computed !== ($storedCrc & 0xFFFFFFFF)) {
@@ -653,14 +623,14 @@ class JdbTransaction
         //   C   table count (uint8)
         //   V   pid (uint32 LE)
         // Timestamp and txnid are decoded separately via unpackU64
-        $hdr = unpack('a4magic/vversion/Ccount/Vpid', substr($crcPayload, 0, 11));
+        $hdr = unpack('a4magic/vversion/Ccount/Vpid/Vtimestamp/a8txnid', $crcPayload);
         if ($hdr['magic'] !== self::TXN_MAGIC) {
             return null;
         }
 
         $count     = (int)$hdr['count'];
-        $timestamp = self::unpackU64($crcPayload, 11);
-        $txnid     = bin2hex(substr($crcPayload, 19, 8));
+        $timestamp = (int)$hdr['timestamp'];
+        $txnid     = bin2hex($hdr['txnid']);
 
         // Verify that the file is large enough to hold all declared table records
         $expectedSize = $minSize + $count * self::TXN_TABLE_SIZE;
@@ -673,12 +643,12 @@ class JdbTransaction
         $pos    = $minSize;
         for ($i = 0; $i < $count; $i++) {
             $rec    = substr($raw, $pos, self::TXN_TABLE_SIZE);
-            $header = unpack('Cname_len/a63name', substr($rec, 0, 64));
+            $header = unpack('Cname_len/a63name/Vdata/Vindex', $rec);
             // Use name_len to strip the null-padding from the stored name
             $table  = substr($header['name'], 0, (int)$header['name_len']);
             $tables[$table] = array(
-                'data'  => self::unpackU64($rec, 64),
-                'index' => self::unpackU64($rec, 72),
+                'data'  => (int)$header['data'],
+                'index' => (int)$header['index'] 
             );
             $pos += self::TXN_TABLE_SIZE;
         }

@@ -272,6 +272,13 @@ class JsonDatabase
                 return false;
             }
 
+            if (JdbConfig::get('fsync') && !JdbUtil::fsyncFp($fp)) {
+                JdbErrorHandler::push('JsonDatabase', 'insert',
+                    "fsync data file failed [id={$id}]");
+                ftruncate($fp, $rollbackOffset);
+                return false;
+            }
+
             $this->idx->bumpNextId();
 
             if ($this->idx->commitWrite() !== JdbBinaryIndex::OK) {
@@ -415,40 +422,56 @@ class JsonDatabase
             $batchBaseId = $this->idx->nextId();
             $batchAutoCount = 0;
 
+            $preparedRecords = array();
+            $buffer          = '';
+            $seenIds         = array(); // duplicate guard intra-batch
+
             foreach ($rows as $rowIndex => $data) {
                 if (!is_array($data)) {
                     JdbErrorHandler::push('JsonDatabase', 'insertBatch',
                         "row #{$rowIndex} is not an array");
-                    ftruncate($fp, $batchStartOffset);
                     return false;
                 }
 
-                // Resolve ID: explicit 'id' in data, or auto-increment
                 if (isset($data['id'])) {
                     $idVal = $data['id'];
-                    $id     = (string)$idVal;
+                    $id    = (string)$idVal;
                 } else {
                     $idVal = $batchBaseId + $batchAutoCount;
-                    $id     = (string)$idVal;
+                    $id    = (string)$idVal;
                     $batchAutoCount++;
                 }
-
                 $data['id'] = $idVal;
 
-                // writeSingleRecord enforces duplicate guard, versioning and
-                // idx->put in one shared place. allowDuplicate=false: an explicit
-                // ID that already exists in the index causes the whole batch to
-                // roll back, consistent with insert() and insertWithId().
-                $result = $this->writeSingleRecord($fp, $id, $data, $currentOffset, false);
-                if ($result === false) {
+                // Guard intra-batch: due righe con lo stesso ID nella stessa
+                // chiamata vengono rifiutate prima ancora di andare su disco.
+                if (isset($seenIds[$id])) {
                     JdbErrorHandler::push('JsonDatabase', 'insertBatch',
-                        "writeSingleRecord failed on row #{$rowIndex} [id={$id}]");
-                    ftruncate($fp, $batchStartOffset);
+                        "duplicate id={$id} within the same batch (row #{$rowIndex})");
                     return false;
                 }
+                $seenIds[$id] = true;
 
-                $insertedIds[] = $idVal;
+                $prepared = $this->prepareRecord($id, $data, $currentOffset, false);
+                if ($prepared === false) {
+                    JdbErrorHandler::push('JsonDatabase', 'insertBatch',
+                        "prepareRecord failed on row #{$rowIndex} [id={$id}]");
+                    return false; // nessun fwrite ancora
+                }
+
+                $buffer          .= $prepared['line'];
+                $preparedRecords[] = $prepared;
+                $insertedIds[]     = $idVal;
                 $inserted++;
+            }
+
+            // Phase 2: single fwrite of the entire buffer
+            $bufLen = strlen($buffer);
+            if ($bufLen > 0 && fwrite($fp, $buffer) !== $bufLen) {
+                JdbErrorHandler::push('JsonDatabase', 'insertBatch',
+                    'fwrite buffer failed');
+                ftruncate($fp, $batchStartOffset);
+                return false;
             }
 
             if ($batchAutoCount > 0) {
@@ -459,6 +482,24 @@ class JsonDatabase
                 JdbErrorHandler::push('JsonDatabase', 'insertBatch', 'fflush failed');
                 ftruncate($fp, $batchStartOffset);
                 return false;
+            }
+            if (JdbConfig::get('fsync') && !JdbUtil::fsyncFp($fp)) {
+                JdbErrorHandler::push('JsonDatabase', 'insertBatch', 'fsync data file failed');
+                ftruncate($fp, $batchStartOffset);
+                return false;
+            }
+
+            // Phase 3: update index
+            foreach ($preparedRecords as $prepared) {
+                if ($this->idx->putEx(
+                        $prepared['id'], $prepared['offset'],
+                        $prepared['length'], $prepared['version'],
+                        $prepared['probe']) !== JdbBinaryIndex::OK) {
+                    JdbErrorHandler::push('JsonDatabase', 'insertBatch',
+                        "idx->putEx failed [id={$prepared['id']}]");
+                    ftruncate($fp, $batchStartOffset);
+                    return false;
+                }
             }
 
             // Atomicity guarantee:
@@ -901,6 +942,12 @@ class JsonDatabase
                 return false;
             }
 
+            if (JdbConfig::get('fsync') && !JdbUtil::fsyncFp($fp)) {
+                JdbErrorHandler::push('JsonDatabase', 'update', "fsync data file failed [id={$id}]");
+                ftruncate($fp, $rollbackOffset);
+                return false;
+            }
+
             if ($this->idx->commitWrite() !== JdbBinaryIndex::OK) {
                 JdbErrorHandler::push('JsonDatabase', 'update', 'commitWrite failed');
                 ftruncate($fp, $rollbackOffset);
@@ -1214,7 +1261,7 @@ class JsonDatabase
             $tmpIdxFp = fopen($tempIndex, 'w+b');
             if (!is_resource($tmpIdxFp)) { return false; }
 
-            if (JdbBinaryIndex::writeHeader($tmpIdxFp, $slots, 0, $nextId, 0) === false) {
+            if (JdbBinaryIndex::writeHeader($tmpIdxFp, $slots, 0, $nextId, 0, 0, 0) === false) {
                 return false;
             }
             if (!JdbUtil::writeEmptySlots($tmpIdxFp, $slots, JdbBinaryIndex::SLOT_SIZE)) {
@@ -1234,7 +1281,7 @@ class JsonDatabase
                 }
             }
 
-            if (JdbBinaryIndex::writeHeader($tmpIdxFp, $slots, $indexCount, $nextId, 0) === false) {
+            if (JdbBinaryIndex::writeHeader($tmpIdxFp, $slots, $indexCount, $nextId, 0, 0, 0) === false) {
                 return false;
             }
             fclose($tmpIdxFp); $tmpIdxFp = null;
@@ -1359,51 +1406,59 @@ class JsonDatabase
             $nextId = $idx->nextId();
             $slots   = $idx->slots();
 
-            $totalLines     = 0;
-            $deleteRecords = 0;
-            if (fseek($fp, JdbUtil::DATA_HEADER_SIZE) !== 0) {
-                return false;
-            }
+            $counters      = $idx->headerCounters();
+            $countersValid = ($counters !== null)
+                && ($counters['deleted_count']     !== JdbIndexHeader::HDR_COUNTERS_INVALID)
+                && ($counters['obsolete_versions'] !== JdbIndexHeader::HDR_COUNTERS_INVALID);
 
-            $overlapSize = 8; // strlen('"_deleted"') - 2: overlap guard to avoid splitting the key across chunks
-            $carry       = '';
-            $bufferSize = 65536;
-
-            while (true) {
-                $raw = fread($fp, $bufferSize);
-                if ($raw === false || $raw === '') {
-                    break;
+            if ($countersValid) {
+                $deleteRecords = (int)$counters['deleted_count'];
+                $obsolete      = (int)$counters['obsolete_versions'];
+                $totalLines    = $count + $deleteRecords + $obsolete;
+            } else {
+                // Fallback scan
+                $totalLines     = 0;
+                $deleteRecords = 0;
+                if (fseek($fp, JdbUtil::DATA_HEADER_SIZE) !== 0) {
+                    return false;
                 }
 
-                $chunk  = $carry . $raw;
-                $isLast = feof($fp);
+                $overlapSize = 8;
+                $carry       = '';
+                $bufferSize  = 65536;
 
-                if ($isLast) {
-                    // $carry has not been counted yet: process everything without splitting
-                    $totalLines     += substr_count($chunk, '"id"');
-                    $deleteRecords += substr_count($chunk, '"_deleted"');
-                    $carry = '';
-                    break;
+                while (true) {
+                    $raw = fread($fp, $bufferSize);
+                    if ($raw === false || $raw === '') {
+                        break;
+                    }
+                    $chunk  = $carry . $raw;
+                    $isLast = feof($fp);
+                    if ($isLast) {
+                        $totalLines    += substr_count($chunk, '"id"');
+                        $deleteRecords += substr_count($chunk, '"_deleted"');
+                        $carry = '';
+                        break;
+                    }
+                    $safeLen = strlen($chunk) - $overlapSize;
+                    if ($safeLen > 0) {
+                        $safe           = substr($chunk, 0, $safeLen);
+                        $totalLines    += substr_count($safe, '"id"');
+                        $deleteRecords += substr_count($safe, '"_deleted"');
+                        $carry          = substr($chunk, $safeLen);
+                    } else {
+                        $carry = $chunk;
+                    }
+                }
+                if ($carry !== '') {
+                    $totalLines    += substr_count($carry, '"id"');
+                    $deleteRecords += substr_count($carry, '"_deleted"');
                 }
 
-                $safeLen = strlen($chunk) - $overlapSize;
-                if ($safeLen > 0) {
-                    $safe = substr($chunk, 0, $safeLen);
-                    $totalLines     += substr_count($safe, '"id"');
-                    $deleteRecords += substr_count($safe, '"_deleted"');
-                    $carry = substr($chunk, $safeLen); // last $overlapSize bytes, not yet counted
-                } else {
-                    $carry = $chunk; // chunk too small, accumulate without counting
-                }
-            }
+                $obsolete = max(0, $totalLines - $count - $deleteRecords);
 
-            // Defensive: if the loop exits without isLast (empty file or read error)
-            if ($carry !== '') {
-                $totalLines     += substr_count($carry, '"id"');
-                $deleteRecords += substr_count($carry, '"_deleted"');
+                $idx->updateCounters($deleteRecords, $obsolete);
             }
-
-            $obsolete = max(0, $totalLines - $count - $deleteRecords);
 
             // Secondary index info
             $secondary = array();
@@ -1705,7 +1760,7 @@ class JsonDatabase
             return false;
         }
         try {
-            if (JdbBinaryIndex::writeHeader($emptyFp, JdbBinaryIndex::INIT_SLOTS, 0, 1, 0) === false) {
+            if (JdbBinaryIndex::writeHeader($emptyFp, JdbBinaryIndex::INIT_SLOTS, 0, 1, 0, 0, 0) === false) {
                 return false;
             }
             $empty = str_repeat("\x00", JdbBinaryIndex::SLOT_SIZE);
@@ -2134,7 +2189,7 @@ class JsonDatabase
         }
 
         try {
-            if (JdbBinaryIndex::writeHeader($tmpFp, $slots, 0, $nextId, 0) === false
+            if (JdbBinaryIndex::writeHeader($tmpFp, $slots, 0, $nextId, 0, 0, 0) === false
                 || !JdbUtil::writeEmptySlots($tmpFp, $slots, JdbBinaryIndex::SLOT_SIZE)
             ) {
                 return false;
@@ -2184,7 +2239,7 @@ class JsonDatabase
                 }
             }
 
-            JdbBinaryIndex::writeHeader($tmpFp, $slots, $count, $nextId, 0);
+            JdbBinaryIndex::writeHeader($tmpFp, $slots, $count, $nextId, 0, 0, 0);
         } finally {
             fclose($tmpFp);
             foreach ($handles as $h) {
@@ -2202,4 +2257,56 @@ class JsonDatabase
         return true;
     }
 
+    /**
+     * PREPARE RECORD — Phase 1 - Write buffering of insertBatch().
+     *
+     * Executes only duplicate-check and json_encode.
+     * Returns an array with all the metadata needed for the phase 2.
+     *
+     * @param  string $id
+     * @param  array  $data            $data['id'] already set by the caller
+     * @param  int    &$currentOffset  Progressive offset
+     * @param  bool   $allowDuplicate
+     * @return array|false
+     *   ['id', 'line', 'offset', 'length', 'version', 'probe', 'is_new'] | false
+     */
+    private function prepareRecord($id, array $data, &$currentOffset, $allowDuplicate = false)
+    {
+        $id    = JdbUtil::normalizeId($id);
+        $probe = $this->idx->lookupEx($id);
+
+        if (!$allowDuplicate && $probe !== null) {
+            JdbErrorHandler::push('JsonDatabase', 'prepareRecord',
+                "duplicate id={$id} rejected (allowDuplicate=false)");
+            return false;
+        }
+
+        $line = json_encode($data);
+        if ($line === false) {
+            JdbErrorHandler::push('JsonDatabase', 'prepareRecord',
+                "json_encode failed [id={$id}]");
+            return false;
+        }
+        $line  .= "\n";
+        $length = strlen($line);
+        $offset = $currentOffset;
+        $currentOffset += $length;
+
+        $existing   = ($probe !== null) ? $probe['entry'] : null;
+        $newVersion = ($existing !== null) ? min(0xFFFF, $existing['version'] + 1) : 1;
+        if ($existing !== null && $existing['version'] >= 0xFFFF) {
+            JdbErrorHandler::push('JsonDatabase', 'prepareRecord',
+                "version overflow prevented for id={$id} (capped at 0xFFFF)");
+        }
+
+        return array(
+            'id'      => $id,
+            'line'    => $line,
+            'offset'  => $offset,
+            'length'  => $length,
+            'version' => $newVersion,
+            'probe'   => $probe,
+            'is_new'  => ($existing === null),
+        );
+    }
 }
